@@ -1,10 +1,11 @@
-import { useState, useMemo } from 'react'
+import { useState, useMemo, useEffect, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
 import {
   AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
 } from 'recharts'
 import { format, parseISO, startOfMonth, endOfMonth, eachDayOfInterval } from 'date-fns'
+import { transactionsDB, recurringDB, budgetsDB } from './lib/supabase'
 import './App.css'
 
 // ============ UTILITIES ============
@@ -126,8 +127,13 @@ const Icons = {
 function App() {
   const [activeTab, setActiveTab] = useState('dashboard')
   const [transactions, setTransactions] = useState(initialTransactions)
+  const [recurring, setRecurring] = useState(recurringPayments)
+  const [budgetData, setBudgetData] = useState(budgets)
   const [showModal, setShowModal] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [loading, setLoading] = useState(true)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState(null)
 
   // Form state
   const [entryType, setEntryType] = useState('expense')
@@ -135,6 +141,63 @@ function App() {
   const [merchant, setMerchant] = useState('')
   const [category, setCategory] = useState('')
   const [account, setAccount] = useState('SBI')
+  const [transactionDate, setTransactionDate] = useState(format(new Date(), 'yyyy-MM-dd'))
+
+  // Check if Supabase is configured
+  const isSupabaseConfigured = import.meta.env.VITE_SUPABASE_URL && import.meta.env.VITE_SUPABASE_ANON_KEY
+
+  // Fetch data from database
+  const fetchData = useCallback(async () => {
+    if (!isSupabaseConfigured) {
+      setLoading(false)
+      return
+    }
+
+    try {
+      setLoading(true)
+      setError(null)
+
+      const [transactionsData, recurringData, budgetsData] = await Promise.all([
+        transactionsDB.getAll(),
+        recurringDB.getAll(),
+        budgetsDB.getAll()
+      ])
+
+      // Transform database data to match our format
+      const transformedTransactions = transactionsData.map(t => ({
+        id: t.id,
+        name: t.name,
+        category: t.category,
+        account: t.account,
+        amount: parseFloat(t.amount),
+        date: t.date,
+        type: t.type
+      }))
+
+      const transformedRecurring = recurringData.map(r => ({
+        id: r.id,
+        name: r.name,
+        frequency: r.frequency,
+        renewDate: r.renew_date,
+        amount: parseFloat(r.amount),
+        icon: r.icon
+      }))
+
+      setTransactions(transformedTransactions.length > 0 ? transformedTransactions : initialTransactions)
+      setRecurring(transformedRecurring.length > 0 ? transformedRecurring : recurringPayments)
+      if (budgetsData.length > 0) setBudgetData(budgetsData)
+
+    } catch (err) {
+      console.error('Error fetching data:', err)
+      setError('Failed to load data. Using offline mode.')
+    } finally {
+      setLoading(false)
+    }
+  }, [isSupabaseConfigured])
+
+  useEffect(() => {
+    fetchData()
+  }, [fetchData])
 
   // Computed values
   const totals = useMemo(() => {
@@ -193,24 +256,45 @@ function App() {
   }, [totals])
 
   // Handlers
-  const handleDelete = (id) => {
+  const handleDelete = async (id) => {
+    if (isSupabaseConfigured) {
+      try {
+        await transactionsDB.delete(id)
+      } catch (err) {
+        console.error('Error deleting:', err)
+      }
+    }
     setTransactions(transactions.filter(t => t.id !== id))
   }
 
-  const handleSave = () => {
+  const handleSave = async () => {
     if (!amount || !merchant) return
+
+    setSaving(true)
     const newTransaction = {
-      id: Date.now(),
       name: merchant,
       category: category || 'Food & Dining',
       account,
       amount: entryType === 'expense' ? -parseFloat(amount) : parseFloat(amount),
-      date: format(new Date(), 'yyyy-MM-dd'),
+      date: transactionDate,
       type: entryType
     }
-    setTransactions([newTransaction, ...transactions])
-    setShowModal(false)
-    resetForm()
+
+    try {
+      if (isSupabaseConfigured) {
+        const saved = await transactionsDB.add(newTransaction)
+        setTransactions([{ ...saved, amount: parseFloat(saved.amount) }, ...transactions])
+      } else {
+        setTransactions([{ id: Date.now(), ...newTransaction }, ...transactions])
+      }
+      setShowModal(false)
+      resetForm()
+    } catch (err) {
+      console.error('Error saving:', err)
+      setError('Failed to save transaction')
+    } finally {
+      setSaving(false)
+    }
   }
 
   const resetForm = () => {
@@ -218,6 +302,7 @@ function App() {
     setMerchant('')
     setCategory('')
     setEntryType('expense')
+    setTransactionDate(format(new Date(), 'yyyy-MM-dd'))
   }
 
   const CustomTooltip = ({ active, payload, label }) => {
@@ -251,8 +336,34 @@ function App() {
     budgets: { title: 'Budgets', subtitle: 'Track your limits' },
   }
 
+  // Loading state
+  if (loading) {
+    return (
+      <div className="loading-screen">
+        <div className="loading-content">
+          <div className="loading-logo">₹</div>
+          <div className="loading-text">Loading your finances...</div>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="app">
+      {/* Error Toast */}
+      {error && (
+        <div className="error-toast" onClick={() => setError(null)}>
+          {error}
+        </div>
+      )}
+
+      {/* Supabase Status Banner */}
+      {!isSupabaseConfigured && (
+        <div className="offline-banner">
+          Demo Mode - Set up Supabase for persistent storage
+        </div>
+      )}
+
       {/* Sidebar Overlay */}
       <div
         className={`sidebar-overlay ${sidebarOpen ? 'visible' : ''}`}
@@ -526,7 +637,7 @@ function App() {
                       </div>
                       <div className="card-body no-padding">
                         <div className="recurring-list">
-                          {recurringPayments.slice(0, 4).map(p => (
+                          {recurring.slice(0, 4).map(p => (
                             <div key={p.id} className="recurring-item">
                               <div className="recurring-icon">{p.icon}</div>
                               <div className="recurring-info">
@@ -704,7 +815,7 @@ function App() {
                         <Icons.Repeat />
                       </div>
                       <div className="stat-card-label">Monthly Total</div>
-                      <div className="stat-card-value">{formatINR(recurringPayments.reduce((s, p) => s + p.amount, 0))}</div>
+                      <div className="stat-card-value">{formatINR(recurring.reduce((s, p) => s + p.amount, 0))}</div>
                     </div>
                   </div>
                   <div className="grid-col-4">
@@ -722,7 +833,7 @@ function App() {
                         <Icons.CreditCard />
                       </div>
                       <div className="stat-card-label">Active Subscriptions</div>
-                      <div className="stat-card-value">{recurringPayments.length}</div>
+                      <div className="stat-card-value">{recurring.length}</div>
                     </div>
                   </div>
 
@@ -734,7 +845,7 @@ function App() {
                       </div>
                       <div className="card-body no-padding">
                         <div className="recurring-list">
-                          {recurringPayments.map(p => (
+                          {recurring.map(p => (
                             <div key={p.id} className="recurring-item">
                               <div className="recurring-icon">{p.icon}</div>
                               <div className="recurring-info">
@@ -766,7 +877,7 @@ function App() {
                 <div className="dashboard-grid">
                   <div className="grid-col-12">
                     <div className="budget-grid">
-                      {budgets.map(b => {
+                      {budgetData.map(b => {
                         const percent = (b.spent / b.budget) * 100
                         const remaining = b.budget - b.spent
                         const status = percent < 70 ? 'safe' : percent < 100 ? 'warning' : 'danger'
@@ -848,9 +959,10 @@ function App() {
             />
             <motion.div
               className="modal"
-              initial={{ opacity: 0, y: 50 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 50 }}
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              transition={{ duration: 0.2 }}
             >
               <div className="modal-header">
                 <h2 className="modal-title">Add Transaction</h2>
@@ -927,13 +1039,23 @@ function App() {
                     {accounts.map(acc => <option key={acc} value={acc}>{acc}</option>)}
                   </select>
                 </div>
+
+                <div className="form-group">
+                  <label className="form-label">Date</label>
+                  <input
+                    type="date"
+                    className="form-input"
+                    value={transactionDate}
+                    onChange={(e) => setTransactionDate(e.target.value)}
+                  />
+                </div>
               </div>
               <div className="modal-footer">
-                <button className="btn btn-secondary btn-full" onClick={() => setShowModal(false)}>
+                <button className="btn btn-secondary btn-full" onClick={() => setShowModal(false)} disabled={saving}>
                   Cancel
                 </button>
-                <button className="btn btn-primary btn-full" onClick={handleSave} disabled={!amount || !merchant}>
-                  Save Transaction
+                <button className="btn btn-primary btn-full" onClick={handleSave} disabled={!amount || !merchant || saving}>
+                  {saving ? 'Saving...' : 'Save Transaction'}
                 </button>
               </div>
             </motion.div>
